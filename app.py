@@ -56,13 +56,22 @@ if camera_file is not None:
 
 # --- 4. Processing Logic ---
 def dehaze_ai(image, model):
-    # Prepare image for the CNN
+    # Resize large images to avoid RAM crash
+    image.thumbnail((800, 800)) # This keeps the app within 512MB limit
+    
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)) # Standard scaling
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
     
-    img_tensor = transform(image).unsqueeze(0) # Add batch dimension
+    img_tensor = transform(image).unsqueeze(0)
+    
+    with torch.no_grad(): # This is critical; it stops PyTorch from saving math data
+        result_tensor = model(img_tensor)
+        # Clear memory immediately after math
+        torch.cuda.empty_cache() 
+    
+    # ... rest of your code
     
     with torch.no_grad():
         # Pass image through the 5 conv layers [cite: 1, 3]
