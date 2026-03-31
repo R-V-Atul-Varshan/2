@@ -2,112 +2,103 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
 
-st.set_page_config(page_title="Pro Dehaze Studio", layout="wide")
-st.title("Physics-Based Image Dehazing")
-st.write("Refined Dark Channel Prior (DCP) with Guided Filtering")
+# --- 1. Define the CNN Architecture (Matches your .pth file) ---
+class AODnet(nn.Module):
+    def __init__(self):
+        super(AODnet, self).__init__()
+        # These layers match the e_conv1 through e_conv5 in your file 
+        self.e_conv1 = nn.Conv2d(3, 3, 1, 1, 0, bias=True) 
+        self.e_conv2 = nn.Conv2d(3, 3, 3, 1, 1, bias=True) 
+        self.e_conv3 = nn.Conv2d(6, 3, 5, 1, 2, bias=True) 
+        self.e_conv4 = nn.Conv2d(6, 3, 7, 1, 3, bias=True) 
+        self.e_conv5 = nn.Conv2d(12, 3, 3, 1, 1, bias=True) 
+        self.relu = nn.ReLU(inplace=True)
 
-# --- Advanced Dehazing Classes & Functions ---
+    def forward(self, x):
+        x1 = self.relu(self.e_conv1(x))
+        x2 = self.relu(self.e_conv2(x1))
+        concat1 = torch.cat((x1, x2), 1)
+        x3 = self.relu(self.e_conv3(concat1))
+        concat2 = torch.cat((x2, x3), 1)
+        x4 = self.relu(self.e_conv4(concat2))
+        concat3 = torch.cat((x1, x2, x3, x4), 1)
+        x5 = self.relu(self.e_conv5(concat3))
+        # AOD-Net Formula: K(x) * I(x) - K(x) + 1
+        clean_image = self.relu((x5 * x) - x5 + 1)
+        return clean_image
 
-class GuidedFilter:
-    """Refines the transmission map by aligning it with the guidance image edges."""
-    def __init__(self, I, radius, eps):
-        self.I = I / 255.0
-        self.radius = radius
-        self.eps = eps
+# --- 2. Load the Pre-trained Model ---
+@st.cache_resource
+def load_model():
+    model = AODnet()
+    # Loading the weights you provided [cite: 5, 10]
+    model.load_state_dict(torch.load('aodnet-pretrained.pth', map_location=torch.device('cpu')))
+    model.eval()
+    return model
 
-    def filter(self, p):
-        p = p / 255.0 if p.max() > 1 else p
-        mean_I = cv2.boxFilter(self.I, -1, (self.radius, self.radius))
-        mean_p = cv2.boxFilter(p, -1, (self.radius, self.radius))
-        mean_Ip = cv2.boxFilter(self.I * p, -1, (self.radius, self.radius))
-        cov_Ip = mean_Ip - mean_I * mean_p
+# --- 3. Streamlit UI Setup ---
+st.set_page_config(page_title="AI Dehazing System", layout="wide")
+st.title("CNN Image Dehazing System")
+st.write("Powered by AOD-Net Deep Learning Model")
 
-        mean_II = cv2.boxFilter(self.I * self.I, -1, (self.radius, self.radius))
-        var_I = mean_II - mean_I * mean_I
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-        a = cov_Ip / (var_I + self.eps)
-        b = mean_p - a * mean_I
+uploaded_file = st.file_uploader("Upload a Hazy Image", type=["jpg","png","jpeg"])
+camera_file = st.camera_input("Or take a picture")
 
-        mean_a = cv2.boxFilter(a, -1, (self.radius, self.radius))
-        mean_b = cv2.boxFilter(b, -1, (self.radius, self.radius))
+if camera_file is not None:
+    uploaded_file = camera_file
 
-        return mean_a * self.I + mean_b
-
-def get_dark_channel(img, size=15):
-    min_channel = np.min(img, axis=2)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
-    return cv2.erode(min_channel, kernel)
-
-def get_atmospheric_light(img, dark, top_percent=0.001):
-    h, w = img.shape[:2]
-    num_pixels = h * w
-    num_brightest = max(int(num_pixels * top_percent), 1)
-    dark_vec = dark.flatten()
-    img_vec = img.reshape(num_pixels, 3)
-    indices = np.argpartition(dark_vec, -num_brightest)[-num_brightest:]
-    return np.mean(img_vec[indices], axis=0)
-
-def get_transmission(img, atms_light, omega=0.95, size=15):
-    norm_img = img / atms_light
-    return 1.0 - omega * get_dark_channel(norm_img, size)
-
-def recover(img, trans, atms_light, t0=0.1):
-    trans = np.maximum(trans, t0)
-    # Reshape for broadcasting
-    trans_stack = np.repeat(trans[:, :, np.newaxis], 3, axis=2)
-    res = (img - atms_light) / trans_stack + atms_light
-    return np.clip(res, 0, 255).astype(np.uint8)
-
-def dehaze_pro(image):
-    img = np.array(image).astype(np.float64)
+# --- 4. Processing Logic ---
+def dehaze_ai(image, model):
+    # Prepare image for the CNN
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)) # Standard scaling
+    ])
     
-    # 1. Dark Channel
-    dark = get_dark_channel(img)
+    img_tensor = transform(image).unsqueeze(0) # Add batch dimension
     
-    # 2. Atmospheric Light
-    atms_light = get_atmospheric_light(img, dark)
+    with torch.no_grad():
+        # Pass image through the 5 conv layers [cite: 1, 3]
+        result_tensor = model(img_tensor)
     
-    # 3. Raw Transmission
-    trans_raw = get_transmission(img, atms_light)
-    
-    # 4. Guided Filter Refinement (The Secret Sauce)
-    # Using the grayscale original image as guidance
-    gray = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    gf = GuidedFilter(gray, radius=60, eps=0.0001)
-    trans_refined = gf.filter(trans_raw)
-    
-    # 5. Recovery
-    result = recover(img, trans_refined, atms_light)
-    
-    # Optional: Light post-processing for vibrancy
-    # Convert to LAB to bump contrast slightly
-    lab = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.equalizeHist(l) # Simple brightness balance
-    # Blend original L with equalized L for natural look
-    l = cv2.addWeighted(l, 0.2, cv2.split(cv2.cvtColor(result, cv2.COLOR_RGB2LAB))[0], 0.8, 0)
-    result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
-    
+    # Convert back to viewable image
+    result = result_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    result = np.clip(result * 255, 0, 255).astype(np.uint8)
     return result
 
-# --- UI Layout ---
-
-uploaded_file = st.file_uploader("Upload Hazy Image", type=["jpg", "png", "jpeg"])
-
-if uploaded_file:
+# --- 5. Main Execution ---
+if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
-    
+    model = load_model()
+
     col1, col2 = st.columns(2)
+
     with col1:
-        st.image(image, caption="Hazy Input", use_container_width=True)
-    
-    with st.spinner("Removing atmospheric particles..."):
-        cleared_img = dehaze_pro(image)
-        
+        st.subheader("Original Hazy Image")
+        st.image(image, use_container_width=True)
+
+    with st.spinner("AI is analyzing atmospheric light..."):
+        result = dehaze_ai(image, model)
+
     with col2:
-        st.image(cleared_img, caption="Dehazed Result", use_container_width=True)
-        
-    # Download Button
-    result_pil = Image.fromarray(cleared_img)
-    st.download_button("Download Clear Image", data=uploaded_file, file_name="dehazed.png")
+        st.subheader("AI Dehazed Result")
+        st.image(result, use_container_width=True)
+
+    # Save to history
+    if not any(np.array_equal(result, h) for h in st.session_state.history):
+        st.session_state.history.append(result)
+
+# History Section
+if st.session_state.history:
+    st.divider()
+    st.subheader("Recent Cleared Images")
+    cols = st.columns(4)
+    for i, img in enumerate(reversed(st.session_state.history[-4:])):
+        cols[i].image(img, caption=f"Result {len(st.session_state.history)-i}")
